@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Local Data / States
+tweet_records.csv
+achievements.json
+replied_tweets.json
+dqn_checkpoint.pt
+
+# Typos
+=1.2.0
+=2.0.0
+=4.14.0
