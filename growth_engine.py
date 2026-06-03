@@ -8,9 +8,12 @@ import csv
 import json
 import os
 import random
+import sqlite3
 import subprocess
 import time
 import threading
+import requests
+import urllib.parse
 import numpy as np
 from datetime import datetime, timedelta
 from collections import deque
@@ -46,15 +49,61 @@ class XClient:
             access_token=X_CONFIG["access_token"],
             access_token_secret=X_CONFIG["access_secret"],
         )
+        auth = tweepy.OAuth1UserHandler(
+            X_CONFIG["api_key"], X_CONFIG["api_secret"],
+            X_CONFIG["access_token"], X_CONFIG["access_secret"]
+        )
+        self.api = tweepy.API(auth)
         self.user_id = self._get_own_user_id()
 
     def _get_own_user_id(self) -> str:
         me = self.client.get_me()
         return str(me.data.id)
 
-    def post_tweet(self, text: str) -> Optional[str]:
+    def is_verified(self) -> bool:
         try:
-            response = self.client.create_tweet(text=text)
+            me = self.client.get_me(user_fields=["verified"])
+            return getattr(me.data, "verified", False)
+        except Exception:
+            return False
+
+    def is_verified(self) -> bool:
+        try:
+            me = self.client.get_me(user_fields=["verified"])
+            return getattr(me.data, "verified", False)
+        except Exception:
+            return False
+
+    def fetch_space_image(self, query: str) -> Optional[str]:
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://images-api.nasa.gov/search?q={encoded_query}&media_type=image"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                items = response.json().get("collection", {}).get("items", [])
+                if items:
+                    # Pick a random image from top 5 results
+                    item = random.choice(items[:5])
+                    image_url = item["links"][0]["href"]
+                    # Download image
+                    img_data = requests.get(image_url, timeout=10).content
+                    filepath = f"/tmp/nasa_{int(time.time())}.jpg"
+                    with open(filepath, "wb") as f:
+                        f.write(img_data)
+                    return filepath
+        except Exception as e:
+            print(f"  ⚠️ NASA API error: {e}")
+        return None
+
+    def post_tweet(self, text: str, image_path: Optional[str] = None) -> Optional[str]:
+        try:
+            if image_path:
+                media = self.api.media_upload(image_path)
+                response = self.client.create_tweet(text=text, media_ids=[media.media_id])
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            else:
+                response = self.client.create_tweet(text=text)
             tweet_id = str(response.data['id'])
             print(f"  ✅ Posted: {tweet_id} | {text[:80]}...")
             return tweet_id
@@ -96,6 +145,8 @@ class XClient:
                 tweet_id,
                 tweet_fields=["public_metrics", "non_public_metrics"],
             )
+            if not tweet or not tweet.data:
+                return {"impressions": 0, "likes": 0, "retweets": 0, "replies": 0, "bookmarks": 0}
             metrics = tweet.data.public_metrics
             non_public = tweet.data.get("non_public_metrics", {})
             impressions = non_public.get("impression_count", 0) if non_public else 0
@@ -165,6 +216,14 @@ NICHE_CONFIG = {
     "max_posts": 10000,
     "posts_per_day": 20,
     "alpha": 1e-5,
+    "beta": 0.01,
+    "feedback_delay_hours": int(os.getenv("FEEDBACK_DELAY_HOURS", 4)),
+    "weights": {
+        "like": 0.5,
+        "retweet": 20.0,
+        "reply": 13.5,
+        "bookmark": 17.0,
+    },
     "topics": [
         "Orion heat shield and re-entry",
         "SLS core stage stacking",
@@ -187,6 +246,14 @@ NICHE_CONFIG = {
         "International partnerships on Artemis",
         "The Earthfall moment Earth seen from beyond the Moon",
     ],
+    "feedback_delay_hours": int(os.getenv("FEEDBACK_DELAY_HOURS", 4)),
+    "weights": {
+        "like": 0.5,
+        "retweet": 20.0,
+        "reply": 13.5,
+        "bookmark": 17.0,
+    },
+    "beta": 0.01,
     "events": [
         {"date": "2026-09-01", "label": "Artemis 2 prep ramp", "topic": "Artemis 2 launch timeline late 2026"},
         {"date": "2026-12-01", "label": "Artemis 2 launch window", "topic": "Artemis 2 crew: Reid Wiseman, Victor Glover, Christina Koch, Jeremy Hansen"},
@@ -235,6 +302,21 @@ NICHE_CONFIG = {
             ),
             "is_thread": False,
         },
+        "Visual_Hype": {
+            "template": (
+                "Write an awe-inspiring, visually evocative tweet about {topic}. "
+                "Assume this tweet will have a breathtaking NASA image attached to it. "
+                "Output only the tweet text, max 200 characters."
+            ),
+            "is_thread": False,
+        },
+        "News_Break": {
+            "template": (
+                "Write a breaking-news style hot take based on this recent headline: {topic}. "
+                "Be authoritative and sharp. End with a 🚀 emoji. Output only the tweet text."
+            ),
+            "is_thread": False,
+        },
     },
 }
 
@@ -254,6 +336,14 @@ class TweetRecord:
     reward: float
     posted_at: datetime
     metrics_collected: bool = False
+    likes: int = 0
+    retweets: int = 0
+    replies: int = 0
+    bookmarks: int = 0
+    likes: int = 0
+    retweets: int = 0
+    replies: int = 0
+    bookmarks: int = 0
 
 
 # ------------------------------
@@ -402,60 +492,78 @@ class MetricsCollector:
     """
 
     def __init__(self, x_client: XClient, state_tracker, agent: DQNAgent,
-                 engagement_predictor, checkpoint_file: str = "tweet_records.csv"):
+                 engagement_predictor, db_file: str = "tweet_records.db"):
         self.x_client = x_client
         self.state_tracker = state_tracker
         self.agent = agent
         self.predictor = engagement_predictor
-        self.checkpoint_file = checkpoint_file
+        self.db_file = db_file
         self.pending_tweets: List[TweetRecord] = []
         self.collected_tweets: List[TweetRecord] = []
-        self._load_checkpoint()
+        self._init_db()
 
-    def _load_checkpoint(self):
-        """Load previously posted tweet records from CSV."""
-        if os.path.exists(self.checkpoint_file):
-            with open(self.checkpoint_file, "r") as f:
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS tweet_records (
+            tweet_id TEXT PRIMARY KEY, text TEXT, archetype TEXT, topic TEXT,
+            follower_count_before INTEGER, impressions INTEGER, follower_delta INTEGER,
+            reward REAL, posted_at TEXT, metrics_collected INTEGER,
+            likes INTEGER DEFAULT 0, retweets INTEGER DEFAULT 0,
+            replies INTEGER DEFAULT 0, bookmarks INTEGER DEFAULT 0
+        )''')
+        
+        # CSV Migration
+        old_csv = "tweet_records.csv"
+        c.execute("SELECT COUNT(*) FROM tweet_records")
+        count = c.fetchone()[0]
+        if count == 0 and os.path.exists(old_csv):
+            print("🔄 Migrating historical data from CSV to SQLite...")
+            with open(old_csv, "r") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    record = TweetRecord(
-                        tweet_id=row["tweet_id"],
-                        text=row["text"],
-                        archetype=row["archetype"],
-                        topic=row["topic"],
-                        follower_count_before=int(row["follower_count_before"]),
-                        impressions=int(row["impressions"]),
-                        follower_delta=int(row["follower_delta"]),
-                        reward=float(row["reward"]),
-                        posted_at=datetime.fromisoformat(row["posted_at"]),
-                        metrics_collected=row["metrics_collected"] == "True",
-                    )
-                    self.collected_tweets.append(record)
-            print(f"📂 Loaded {len(self.collected_tweets)} historical records.")
+                    c.execute('''INSERT INTO tweet_records 
+                        (tweet_id, text, archetype, topic, follower_count_before, impressions, follower_delta, reward, posted_at, metrics_collected)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (row["tweet_id"], row["text"], row["archetype"], row["topic"], int(row["follower_count_before"]),
+                         int(row["impressions"]), int(row["follower_delta"]), float(row["reward"]),
+                         row["posted_at"], 1 if row["metrics_collected"] == "True" else 0))
+            print("✅ CSV migration complete.")
+            
+        conn.commit()
+        
+        c.execute("SELECT * FROM tweet_records ORDER BY posted_at ASC")
+        for row in c.fetchall():
+            record = TweetRecord(
+                tweet_id=row[0], text=row[1], archetype=row[2], topic=row[3],
+                follower_count_before=row[4], impressions=row[5], follower_delta=row[6],
+                reward=row[7], posted_at=datetime.fromisoformat(row[8]),
+                metrics_collected=bool(row[9]), likes=row[10], retweets=row[11],
+                replies=row[12], bookmarks=row[13]
+            )
+            if record.metrics_collected:
+                self.collected_tweets.append(record)
+            else:
+                self.pending_tweets.append(record)
+        conn.close()
+        print(f"📂 Loaded {len(self.collected_tweets)} collected, {len(self.pending_tweets)} pending records from DB.")
 
-    def _save_checkpoint(self):
-        """Save all records to CSV."""
-        all_records = self.collected_tweets + self.pending_tweets
-        with open(self.checkpoint_file, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "tweet_id", "text", "archetype", "topic",
-                "follower_count_before", "impressions", "follower_delta",
-                "reward", "posted_at", "metrics_collected",
-            ])
-            writer.writeheader()
-            for r in all_records:
-                writer.writerow({
-                    "tweet_id": r.tweet_id,
-                    "text": r.text,
-                    "archetype": r.archetype,
-                    "topic": r.topic,
-                    "follower_count_before": r.follower_count_before,
-                    "impressions": r.impressions,
-                    "follower_delta": r.follower_delta,
-                    "reward": r.reward,
-                    "posted_at": r.posted_at.isoformat(),
-                    "metrics_collected": str(r.metrics_collected),
-                })
+    def _save_record_to_db(self, record: TweetRecord, update: bool = False):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        if update:
+            c.execute('''UPDATE tweet_records SET 
+                impressions=?, follower_delta=?, reward=?, metrics_collected=?,
+                likes=?, retweets=?, replies=?, bookmarks=? WHERE tweet_id=?''',
+                (record.impressions, record.follower_delta, record.reward, int(record.metrics_collected),
+                 record.likes, record.retweets, record.replies, record.bookmarks, record.tweet_id))
+        else:
+            c.execute('''INSERT INTO tweet_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (record.tweet_id, record.text, record.archetype, record.topic, record.follower_count_before,
+                 record.impressions, record.follower_delta, record.reward, record.posted_at.isoformat(),
+                 int(record.metrics_collected), record.likes, record.retweets, record.replies, record.bookmarks))
+        conn.commit()
+        conn.close()
 
     def add_posted_tweet(self, tweet_id: str, text: str, archetype: str, topic: str):
         """Called immediately after a tweet is posted to track it."""
@@ -473,23 +581,28 @@ class MetricsCollector:
             metrics_collected=False,
         )
         self.pending_tweets.append(record)
-        self._save_checkpoint()
+        self._save_record_to_db(record)
 
     def collect_metrics(self):
         """
-        Check all pending tweets. If 24h have passed since posting,
-        fetch real metrics and compute reward.
+        Check pending tweets. If feedback_delay_hours have passed,
+        fetch real metrics, calculate X algorithm score, and compute reward.
         """
         now = datetime.now()
         newly_collected = []
+        delay = NICHE_CONFIG.get("feedback_delay_hours", 4)
 
         for record in self.pending_tweets[:]:
             hours_since_post = (now - record.posted_at).total_seconds() / 3600
-            if hours_since_post >= 24 and not record.metrics_collected:
+            if hours_since_post >= delay and not record.metrics_collected:
                 print(f"\n📊 Collecting metrics for tweet {record.tweet_id}...")
 
                 metrics = self.x_client.get_tweet_metrics(record.tweet_id)
-                record.impressions = metrics["impressions"]
+                record.impressions = metrics.get("impressions", 0)
+                record.likes = metrics.get("likes", 0)
+                record.retweets = metrics.get("retweets", 0)
+                record.replies = metrics.get("replies", 0)
+                record.bookmarks = metrics.get("bookmarks", 0)
 
                 current_followers = self.x_client.get_follower_count()
                 record.follower_delta = current_followers - record.follower_count_before
@@ -519,13 +632,23 @@ class MetricsCollector:
                         except Exception as e:
                             print(f"  ⚠️ Failed to save achievements: {e}")
 
+                w = NICHE_CONFIG.get("weights", {"like": 0.5, "retweet": 20.0, "reply": 13.5, "bookmark": 17.0})
+                engagement_score = (
+                    w["like"] * record.likes +
+                    w["retweet"] * record.retweets +
+                    w["reply"] * record.replies +
+                    w["bookmark"] * record.bookmarks
+                )
+
                 alpha = NICHE_CONFIG["alpha"]
-                record.reward = record.follower_delta + alpha * record.impressions + milestone_bonus
+                beta = NICHE_CONFIG.get("beta", 0.01)
+                record.reward = record.follower_delta + alpha * record.impressions + beta * engagement_score + milestone_bonus
 
                 record.metrics_collected = True
 
                 self.pending_tweets.remove(record)
                 self.collected_tweets.append(record)
+                self._save_record_to_db(record, update=True)
 
                 self.state_tracker.follower_count = current_followers
                 self.predictor.add_sample(record)
@@ -533,10 +656,10 @@ class MetricsCollector:
                 newly_collected.append(record)
 
                 print(f"  Impressions: {record.impressions}")
+                print(f"  Engagements: L:{record.likes} RT:{record.retweets} R:{record.replies} B:{record.bookmarks}")
                 print(f"  Follower Δ: {record.follower_delta}")
                 print(f"  Reward: {record.reward:.4f}")
 
-        self._save_checkpoint()
         return newly_collected
 
     def build_rl_transitions(self):
@@ -566,6 +689,7 @@ class MetricsCollector:
             np.log1p(record.follower_count_before),
             0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, # t / max_posts placeholder
             record.posted_at.hour / 24.0,
             record.posted_at.weekday() / 7.0,
             30.0 / 365.0,
@@ -594,7 +718,23 @@ class MetricsCollector:
                     print(f"  🎯 Epsilon: {self.agent.epsilon:.3f}")
             except Exception as e:
                 print(f"  ⚠️ Metrics collector error: {e}")
-            time.sleep(3600)
+            time.sleep(900)
+
+
+# ------------------------------
+# NEWS FETCHER
+# ------------------------------
+class NewsFetcher:
+    def get_latest_headlines(self, limit: int = 3) -> str:
+        try:
+            resp = requests.get(f"https://api.spaceflightnewsapi.net/v4/articles?limit={limit}", timeout=10)
+            if resp.status_code == 200:
+                articles = resp.json().get("results", [])
+                headlines = [f"{a['title']}: {a['summary']}" for a in articles]
+                return "\n".join(headlines)
+        except Exception as e:
+            print(f"⚠️ Failed to fetch news: {e}")
+        return ""
 
 
 # ------------------------------
@@ -604,6 +744,7 @@ class LLMPipeline:
     def __init__(self, model: str = "llama3.2:3b"):
         self.model = model
         self.archetypes = NICHE_CONFIG["archetypes"]
+        self.news_fetcher = NewsFetcher()
 
     def query(self, prompt: str) -> Optional[str]:
         import urllib.request
@@ -634,7 +775,14 @@ class LLMPipeline:
 
     def generate_candidates(self, action, k: int = 5) -> List[str]:
         arch = self.archetypes[action.archetype]
-        prompt = arch["template"].replace("{topic}", action.topic)
+        
+        topic = action.topic
+        if action.archetype == "News_Break":
+            news = self.news_fetcher.get_latest_headlines(limit=1)
+            if news:
+                topic = news
+                
+        prompt = arch["template"].replace("{topic}", topic)
         candidates = []
         for _ in range(k):
             raw = self.query(prompt)
@@ -785,7 +933,12 @@ class PostScheduler:
         parts = item["parts"]
 
         if len(parts) == 1:
-            tweet_id = self.x_client.post_tweet(parts[0])
+            image_path = None
+            if item["archetype"] == "Visual_Hype":
+                print(f"🌠 Fetching NASA image for: {item['topic']}")
+                image_path = self.x_client.fetch_space_image(item["topic"])
+            
+            tweet_id = self.x_client.post_tweet(parts[0], image_path=image_path)
             if tweet_id:
                 self.posted_today += 1
                 self.metrics_collector.add_posted_tweet(
@@ -842,6 +995,47 @@ class AutoReplyEngine:
         except Exception as e:
             print(f"  ⚠️ Failed to save replied tweets: {e}")
 
+    def _get_recent_history(self, limit: int = 3) -> str:
+        history = []
+        sorted_tweets = sorted(self.replied_tweets.values(), key=lambda x: x.get("quoted_at", ""), reverse=True)
+        for t in sorted_tweets[:limit]:
+            history.append(t.get("quote_text", ""))
+        return "\n".join([f"- {h}" for h in history if h])
+
+    def _score_tweet(self, text: str, author: str = "unknown") -> int:
+        score_prompt = f"""
+You are evaluating whether a tweet is worth quote-tweeting for a space exploration account (@SpaceBase1958).
+
+The X algorithm weights engagement as follows:
+- Retweets: 20x weight
+- Bookmarks: 17x weight  
+- Replies: 13.5x weight
+- Likes: 0.5x weight
+
+This means tweets that provoke retweets, bookmarks, and replies are FAR more valuable than tweets that just get likes.
+
+Tweet Author: @{author}
+Tweet: "{text}"
+
+Rate this tweet's quote-tweet potential from 1 to 10.
+Consider:
+- Is this tweet about a topic that the space community would engage with?
+- Would a quote-tweet on this generate retweets and replies (high-weight metrics)?
+- Is the author influential enough that quoting them would gain visibility?
+- Is this tweet substantive enough to warrant a thoughtful response?
+- Ignore crypto scams, bot spam, and off-topic content (score 1).
+
+Output ONLY a single integer from 1 to 10. Nothing else.
+"""
+        raw = self.llm.query(score_prompt)
+        if not raw:
+            return 1
+        try:
+            score = int(raw.strip())
+            return max(1, min(10, score))
+        except ValueError:
+            return 1
+
     def resolve_targets(self):
         print("🔍 Resolving target accounts to IDs...")
         for username in self.target_usernames:
@@ -855,10 +1049,17 @@ class AutoReplyEngine:
         if not self.target_ids:
             self.resolve_targets()
 
+        replies_this_check = 0
         for username, user_id in self.target_ids.items():
+            if replies_this_check >= 1:
+                break
+                
             print(f"📡 Checking recent tweets from @{username}...")
             tweets = self.x_client.get_recent_tweets(user_id, limit=3)
             for tweet in tweets:
+                if replies_this_check >= 1:
+                    break
+                    
                 tweet_id = tweet["id"]
                 text = tweet["text"]
 
@@ -873,17 +1074,29 @@ class AutoReplyEngine:
 
                 print(f"✨ Found relevant tweet from @{username}: \"{text[:80]}...\"")
                 
+                # LLM Pre-Filter
+                score = self._score_tweet(text, username)
+                print(f"  📊 Score: {score}/10")
+                if score < 6:
+                    print(f"  ⏭️ Skipping (below threshold).")
+                    continue
+                
+                recent_history = self._get_recent_history(3)
+                
                 # Generate reply
                 reply_prompt = f"""
-You are @SpaceBase1958, an enthusiastic, knowledgeable, and sharp space outreach account.
-Write a witty, value-adding, or supportive reply to this tweet from @{username}.
+You are @SpaceBase1958, an authentic, opinionated aerospace enthusiast.
+Write a punchy, value-adding reply to this tweet.
 
-Tweet: "{text}"
+Target Tweet: "{text}"
+
+Recent Replies You've Made (DO NOT REPEAT THESE FACTS OR STRUCTURES):
+{recent_history}
 
 Rules:
-- Keep it under 280 characters.
-- Do not sound like a generic bot. Be authentic, add a neat space fact or sharp insight if possible.
-- End with a relevant emoji.
+- Keep it under 150 characters.
+- NEVER use the phrase "Did you know".
+- Be highly knowledgeable, engaging, and friendly. Do not be cynical or argumentative.
 - Output ONLY the reply text. Do not include quotes.
 """
                 reply_text = self.llm.query(reply_prompt)
@@ -910,9 +1123,84 @@ Rules:
                         posted_id, reply_text, "quote", username
                     )
                 
+                replies_this_check += 1
                 time.sleep(5)
 
             time.sleep(2)
+
+    def hunt_and_reply(self):
+        print("🔭 Hunting for community engagement...")
+        try:
+            response = self.x_client.client.search_recent_tweets(
+                query="(NASA OR Artemis OR SpaceX) -is:retweet -is:reply -has:links lang:en",
+                max_results=10,
+                tweet_fields=["public_metrics"]
+            )
+            if not response or not response.data:
+                return
+
+            replies_this_hunt = 0
+            for tweet in response.data:
+                if replies_this_hunt >= 1:
+                    break
+                    
+                tweet_id = str(tweet.id)
+                text = tweet.text
+                if tweet_id in self.replied_tweets:
+                    continue
+
+                print(f"✨ Found hunt target: \"{text[:80]}...\"")
+                
+                # LLM Pre-Filter
+                score = self._score_tweet(text)
+                print(f"  📊 Score: {score}/10")
+                if score < 6:
+                    print(f"  ⏭️ Skipping (below threshold).")
+                    continue
+                
+                try:
+                    self.x_client.client.like(tweet_id)
+                    print(f"  ❤️ Auto-liked target tweet.")
+                except Exception:
+                    pass
+
+                recent_history = self._get_recent_history(3)
+                reply_prompt = f"""
+You are @SpaceBase1958, an authentic, opinionated aerospace enthusiast.
+Write a punchy, value-adding reply to this tweet.
+
+Target Tweet: "{text}"
+
+Recent Replies You've Made (DO NOT REPEAT THESE FACTS OR STRUCTURES):
+{recent_history}
+
+Rules:
+- Keep it under 150 characters.
+- NEVER use the phrase "Did you know".
+- Be highly knowledgeable, engaging, and friendly. Do not be cynical or argumentative.
+- Output ONLY the reply text. Do not include quotes.
+"""
+                reply_text = self.llm.query(reply_prompt)
+                if not reply_text:
+                    continue
+
+                reply_text = reply_text.strip().strip('"').strip("'")
+                print(f"✍️ Generated hunt reply: \"{reply_text}\"")
+
+                posted_id = self.x_client.post_url_quote(reply_text, "unknown", tweet_id)
+                if posted_id:
+                    self.replied_tweets[tweet_id] = {
+                        "quote_id": posted_id,
+                        "quote_text": reply_text,
+                        "quoted_at": datetime.now().isoformat(),
+                        "target_username": "hunt_target"
+                    }
+                    self._save_replied_tweets()
+                
+                replies_this_hunt += 1
+                time.sleep(5)
+        except Exception as e:
+            print(f"⚠️ Hunt failed: {e}")
 
     def run_loop(self):
         self.running = True
@@ -920,6 +1208,7 @@ Rules:
         while self.running:
             try:
                 self.check_and_reply()
+                self.hunt_and_reply()
             except Exception as e:
                 print(f"⚠️ Error in Auto-Reply loop step: {e}")
             
@@ -1021,6 +1310,12 @@ class GrowthEngine:
 
         # Update state tracker with current follower count
         self.state_tracker.follower_count = self.x_client.get_follower_count()
+
+        # Check verification status
+        if self.x_client.is_verified():
+            print("🌟 Account is verified! Premium algorithmic boost is active.")
+        else:
+            print("ℹ️ Account is not verified. (DQN will adapt organically once active.)")
 
         self.post_count = 0
         self.running = False

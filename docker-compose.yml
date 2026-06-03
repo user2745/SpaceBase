@@ -11,6 +11,7 @@ services:
       - OLLAMA_HOST=http://localhost:11434
     volumes:
       - ./tweet_records.csv:/app/tweet_records.csv
+      - ./tweet_records.db:/app/tweet_records.db
       - ./achievements.json:/app/achievements.json
       - ./replied_tweets.json:/app/replied_tweets.json
       - ./dqn_checkpoint.pt:/app/dqn_checkpoint.pt

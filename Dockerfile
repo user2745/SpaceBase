@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     schedule>=1.2.0 \
     numpy>=1.22.0 \
     python-dotenv>=1.0.0 \
+    requests>=2.28.0 \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     torch>=2.0.0
 
